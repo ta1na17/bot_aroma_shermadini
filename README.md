@@ -125,11 +125,10 @@ python bot_template.py
 
 ---
 
-## 🤝 Поддержка
+## 🤝 Обратная связь
 
-- Email: support@shermadini.com  
-- Telegram: [@your_username](https://t.me/your_username)  
-- Issues: [GitHub Issues](https://github.com/yourusername/shermadini-house-bot/issues)  
+- Telegram: [@your_username](https://t.me/alexvorob17)  
+- Issues: [GitHub Issues](https://github.com/ta1na17/shermadini-house-bot/issues)  
 
 ---
 
