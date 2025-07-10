@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS redirects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item TEXT NOT NULL,
+    user_id INTEGER,
+    timestamp TEXT NOT NULL
+);

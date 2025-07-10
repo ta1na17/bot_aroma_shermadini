@@ -11,9 +11,11 @@ Run: python bot_template.py
 
 import asyncio
 import os
-import logging
 from datetime import datetime
 from io import BytesIO
+
+import aiohttp
+import logging
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -51,11 +53,20 @@ except ValueError:
 EXCEL_PATH = "Tablitsa_bez_povtoriaiushchikhsia_kombinatsii.xlsx"
 
 # ========== Load combination table ==========
-comb_df = pd.read_excel(EXCEL_PATH)  # columns: Комбинация, WB Article
+# ========== Load combination table ==========
+comb_df = pd.read_excel(EXCEL_PATH)  # есть столбцы: Комбинация, WB Article, Фото WB?
 comb_df["WB_link"] = (
-    "https://www.wildberries.ru/catalog/" + comb_df["WB Article"].astype(str) + "/detail.aspx"
+    "https://www.wildberries.ru/catalog/"
+    + comb_df["WB Article"].astype(str)
+    + "/detail.aspx"
 )
-comb_map = comb_df.set_index("Комбинация")["WB_link"].to_dict()
+
+# Убедитесь, что в датафрейме уже есть колонка "Фото WB" (или создайте её ранее)
+# Теперь создаём маппинг: комбинация → (article, link, photo_url)
+comb_map = comb_df.set_index("Комбинация")[
+    ["WB Article", "WB_link", "Фото WB"]
+].to_dict(orient="index")
+
 
 # ========== In-memory statistics (replace with DB in prod) ==========
 class Stats:
@@ -117,8 +128,7 @@ async def start_handler(message: types.Message, state: FSMContext):
         "Сейчас помогу тебе выбрать идеальный аромат, исходя из твоих предпочтений."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Да", callback_data="start:yes")],
-        [InlineKeyboardButton(text="Нет", callback_data="start:no")],
+        [InlineKeyboardButton(text="Начать", callback_data="start:yes")],
     ])
     await message.answer(text, reply_markup=kb)
 
@@ -178,31 +188,56 @@ async def answer_handler(call: types.CallbackQuery, state: FSMContext):
     else:
         await finish_quiz(call.message, answers, state)
 
+
 async def finish_quiz(message: types.Message, answers: list[str], state: FSMContext):
     combo = " + ".join(answers)
-    link = comb_map.get(combo)
+    data = comb_map.get(combo)
 
-    if link:
-        stats.record_click(link)
-        text = (
-            "Отличный выбор! На основе ваших ответов я подобрал подходящий аромат.\n\n"
-            f"Ссылка для покупки: {link}"
-        )
-    else:
-        text = (
+    if not data:
+        await message.answer(
             "К сожалению, по заданной комбинации нет артикула.\n"
             "Мы работаем над расширением ассортимента!"
         )
+        await state.set_state("WAIT_RESTART")
+        return
 
-    await message.answer(text, disable_web_page_preview=False)
+    item = data["WB Article"]
+    photo_url = data.get("Фото WB")
 
-    # Предложение пройти ещё раз
+    # Генерация короткого URL, как раньше
+    redirect_api = (
+        f"http://192.168.1.193:5000/redirect"
+        f"?item={item}"
+        f"&user_id={message.from_user.id}"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.get(redirect_api, allow_redirects=False) as resp:
+            short_path = resp.headers.get("Location")
+    short_url = f"http://192.168.1.193:5000{short_path}"
+
+    # Подпись без HTML
+    caption = "Отличный выбор! Нажмите кнопку ниже, чтобы перейти к покупке."
+
+    # Inline-кнопка с коротким URL
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Перейти к покупке", url=short_url)],
         [InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart:yes")],
-        [InlineKeyboardButton(text="Завершить",    callback_data="restart:no")],
     ])
-    await message.answer("Хотите пройти опрос ещё раз?", reply_markup=kb)
+
+    if photo_url and pd.notna(photo_url):
+        try:
+            await message.answer_photo(
+                photo=photo_url,
+                caption=caption,
+                reply_markup=kb
+            )
+        except Exception:
+            await message.answer(caption, reply_markup=kb)
+    else:
+        await message.answer(caption, reply_markup=kb)
+
     await state.set_state("WAIT_RESTART")
+
 
 async def restart_handler(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -216,43 +251,57 @@ async def restart_handler(call: types.CallbackQuery, state: FSMContext):
         await ask_question(call.message, state, 0)
 
 # ========== Reporting job ==========
-async def send_report(bot: Bot):
-    # Отчёт по прогрессу
-    df_progress = pd.DataFrame({
-        "Этап":     [f"Q{i+1}" for i in range(6)],
-        "Количество": stats.step_counts,
-        "Доля, %":  [
-            round(c / stats.total_starts * 100, 2)
-            if stats.total_starts else 0
-            for c in stats.step_counts
-        ],
-    })
+import re
+from urllib.parse import urlparse, parse_qs, urlunparse
+import sqlite3
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+from aiogram import types
+from aiogram.types import BufferedInputFile
+import logging
+DB_PATH = "urls.db"
 
-    # Отчёт по переходам
-    links = list(stats.link_clicks.items())
-    total_clicks = sum(count for _, count in links)
-    df_links = pd.DataFrame(
-        [{"WB ссылка": link, "Клики": count, "Доля, %": round(count / total_clicks * 100, 2)}
-         for link, count in links]
-    )
+async def send_report(bot):
+    """
+    Выполняет предопределённый SELECT-запрос к SQLite,
+    сохраняет результат в Excel и отправляет админу.
+    """
+    sql_query = """
+    SELECT redirects,
+           item,
+           user_id,
+           datetime(timestamp) AS clicked_at
+    FROM   redirects
+    WHERE  date(timestamp) >= date('now', '-7 day')
+    ORDER  BY clicked_at DESC;
+    """
 
-    # Итоговые метрики
-    summary = pd.DataFrame([{
-        "Всего запусков опроса": stats.total_starts,
-        "Всего переходов по ссылкам": total_clicks
-    }])
+    # 1. Читаем данные из БД через pandas
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            df_result = pd.read_sql_query(sql_query, conn)
+    except Exception as e:
+        logging.error(f"Ошибка SQL-запроса: {e}")
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            f"Не удалось сформировать отчёт.\nОшибка SQL: {e}"
+        )
+        return
 
+    # 2. Записываем в Excel-буфер
     with BytesIO() as buf:
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df_progress.to_excel(writer, index=False, sheet_name="progress")
-            df_links.to_excel(writer, index=False, sheet_name="link_clicks")
-            summary.to_excel(writer, index=False, sheet_name="summary")
+            df_result.to_excel(writer, index=False, sheet_name="data")
         buf.seek(0)
+
+        # 3. Отправляем файл
         await bot.send_document(
             chat_id=ADMIN_CHAT_ID,
-            document=types.BufferedInputFile(buf.read(), "report.xlsx"),
-            caption=f"Отчёт {datetime.now():%d.%m %H:%M}"
+            document=BufferedInputFile(buf.read(), "report.xlsx"),
+            caption=f"Отчёт за последние 7 дней ({datetime.now():%d.%m %H:%M})"
         )
+
 
 
 async def main():
