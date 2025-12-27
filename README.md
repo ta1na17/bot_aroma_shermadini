@@ -127,7 +127,7 @@ python bot_template.py
 
 ## 🤝 Обратная связь
 
-- Telegram: [@your_username](https://t.me/alexvorob17)  
+- Telegram: [@alexvorob17](https://t.me/alexvorob17)  
 - Issues: [GitHub Issues](https://github.com/ta1na17/shermadini-house-bot/issues)  
 
 ---
